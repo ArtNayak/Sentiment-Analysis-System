@@ -9,7 +9,7 @@ from wordcloud import WordCloud
 import matplotlib.pyplot as plt
 from streamlit_option_menu import option_menu
 
-from utils import extract_key_themes, filter_spam, is_safe_url
+from utils import extract_key_themes, filter_spam, request_allowed, resolve_public_target
 
 MAX_COMMENTS = 500  # keeps one analysis run to a sensible length on CPU
 SUMMARY_CHUNK_WORDS = 500  # DistilBART reads at most 1024 tokens, so long text is split
@@ -83,20 +83,28 @@ def create_word_cloud(text):
     return fig
 
 def scrape_comments(url):
-    safe, reason = is_safe_url(url)
-    if not safe:
+    target, reason = resolve_public_target(url)
+    if target is None:
         st.error(reason)
         return []
     comments = []
+    ip_literal = f"[{target.ip}]" if ":" in target.ip else target.ip
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=[
+                # connect to the address that was validated, whatever DNS says later (DNS rebinding)
+                f"--host-resolver-rules=MAP {target.host} {ip_literal}",
+                "--no-proxy-server",  # a proxy would resolve names itself and bypass the pinning
+            ])
             try:
-                page = browser.new_page()
-                page.goto(url, wait_until='networkidle', timeout=20000)
-                # best effort: a redirect must not land on a private address either
-                if not is_safe_url(page.url)[0]:
-                    st.error("The page redirected to a non-public address, so it was not read.")
+                context = browser.new_context()
+                # every request (redirects and subresources included) may only go to the validated host
+                context.route("**/*", lambda route: route.continue_()
+                              if request_allowed(route.request.url, target.host) else route.abort())
+                page = context.new_page()
+                page.goto(target.url, wait_until='networkidle', timeout=20000)
+                if not request_allowed(page.url, target.host):
+                    st.error("The page redirected to a different site, so it was not read.")
                     return []
                 for element in page.query_selector_all("p"):
                     text = element.inner_text()
